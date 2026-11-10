@@ -202,3 +202,77 @@ machine is off, pin the CIDs on an always-on node or a pinning service.
 IPFS is public: anyone with a CID can fetch the photo, and copies cannot
 reliably be recalled. Check photos for location data or anything private before
 adding them.
+
+## Hosting nodes: `heritage_node.py`
+
+A hosting node keeps an always-on copy of approved site histories and their
+photos. It is meant to run anywhere from a VPS to a Raspberry Pi with an SSD
+kept at home or in a site's ticket office.
+
+**Configuration** (`node.example.toml`):
+
+- `index`: the site index, a git repo holding `sites.json`
+  (`"<scheme>:<id>"` → repo URL);
+- `allowed_signers`: the keys this node trusts (`git` namespace for commits,
+  `heritage-photo` for photos);
+- `max_storage`: the most photo data the node will pin;
+- `favourites`: sites the operator wants hosted first. Every other site follows
+  in an order that is random but fixed per node (seeded by its IPFS peer ID), so
+  across many nodes hosting spreads roughly evenly over all sites.
+
+**What it does**, every `poll_interval` and after every review decision:
+
+1. For each site in preference order, fetch its repo and walk the commits after
+   the last approved one. A commit is approved automatically only if it is
+   signed by a trusted key, changes nothing but `photos.json`, leaves the site
+   record alone, only adds photos or signatures, and every new photo is validly
+   signed by a trusted key with an accepted license.
+2. Anything else stops that site and waits in the **review UI**, which shows the
+   reasons and the photos. *Approve* lets the walk continue; *Reject* freezes
+   the site at its last approved commit.
+3. Mirror the approved history in a separate git repo that holds only approved
+   objects (optionally served read-only over HTTP with `public_listen`).
+4. Pin approved photos within `max_storage`, filling sites in preference order.
+   When space runs out, lower-ranked sites are unpinned first and their blocks
+   garbage-collected. Each photo is fetched with a hard byte cap and must match
+   its signed size and look like an image before it is pinned.
+
+**The review UI** is password protected: the password is stored as a scrypt
+hash (`heritage_node.py hash-password`), sessions use `HttpOnly`,
+`SameSite=Strict` cookies, and logins lock after 10 failures in 10 minutes.
+`setup-node.sh` generates and prints a random password on first install.
+
+The UI itself listens on localhost only, so it is never exposed over plain HTTP.
+Reach it either through an SSH tunnel (`ssh -L 8090:127.0.0.1:8090 <node>`,
+then http://127.0.0.1:8090/), or publish it over HTTPS with a reverse proxy:
+
+```nginx
+server {
+    server_name node.example.org;
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+then `sudo certbot --nginx -d node.example.org`, and in `node.toml` set
+`admin_hosts = ["node.example.org"]` and `admin_https = true` (cookies are then
+only sent over HTTPS). Rate limiting `/login` in nginx is a good extra layer.
+
+**Install** on Debian, Ubuntu or Raspberry Pi OS:
+
+```bash
+sudo deploy/setup-node.sh my_allowed_signers
+sudo nano /etc/heritage-node/node.toml     # max_storage, favourites
+sudo systemctl restart heritage-node
+journalctl -u heritage-node -f
+```
+
+The node needs IPFS port 4001 (tcp and udp) reachable for others to fetch the
+photos it pins.
+
+**Not yet covered:** known-CSAM hash matching and image classification before
+review, a signed revocation list, and re-encoding photos to neutralise hidden
+data. Until then, a maintainer sees every photo that is not signed by a trusted
+key before deciding.
