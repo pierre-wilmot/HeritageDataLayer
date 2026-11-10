@@ -4,6 +4,7 @@
   heritage_node.py run  --config node.toml   sync loop + maintainer review UI
   heritage_node.py sync --config node.toml   one sync pass, then exit
   heritage_node.py rank --config node.toml   print this node's site ranking
+  heritage_node.py hash-password             make an admin_password_hash for the config
 
 The node reads a site index (sites.json: "<scheme>:<id>" -> repo URL) and ranks
 the sites: the operator's favourites first, then everything else in an order
@@ -30,7 +31,10 @@ Photos are fetched with a hard byte cap, and must match their signed size and
 look like an image before they are pinned.
 """
 import argparse
+import base64
+import getpass
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -39,8 +43,10 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -67,6 +73,9 @@ DEFAULTS = {
     "poll_interval": 900,
     "admin_listen": "127.0.0.1:8090",
     "admin_hosts": [],
+    "admin_password_hash": "",
+    "admin_https": False,
+    "session_hours": 12,
     "public_listen": "",
     "max_photo_bytes": "50MB",
     "max_repo_bytes": "50MB",
@@ -99,6 +108,30 @@ def human(n):
         n /= 1000
 
 
+SCRYPT = {"n": 2**15, "r": 8, "p": 1, "maxmem": 128 * 2**20, "dklen": 32}
+LOGIN_FAILURES, LOGIN_WINDOW = 10, 600  # at most 10 failed logins per 10 minutes
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode(), salt=salt, **SCRYPT)
+    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+    return f"scrypt${SCRYPT['n']}${SCRYPT['r']}${SCRYPT['p']}${b64(salt)}${b64(dk)}"
+
+
+def check_password(password, stored):
+    try:
+        algo, n, r, p, salt, dk = stored.split("$")
+        if algo != "scrypt":
+            return False
+        dk = base64.b64decode(dk)
+        got = hashlib.scrypt(password.encode(), salt=base64.b64decode(salt), n=int(n), r=int(r), p=int(p),
+                             maxmem=SCRYPT["maxmem"], dklen=len(dk))
+        return hmac.compare_digest(got, dk)
+    except (ValueError, TypeError):
+        return False
+
+
 def load_config(path):
     path = Path(path).expanduser().resolve()
     raw = tomllib.loads(path.read_text())
@@ -123,6 +156,9 @@ def load_config(path):
     bad = [f for f in cfg["favourites"] if not SITE_KEY.match(f)]
     if bad:
         sys.exit(f"bad favourite site id(s): {bad} (expected <scheme>:<id>)")
+    if cfg["admin_password_hash"] and not re.fullmatch(r"scrypt\$\d+\$\d+\$\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+",
+                                                       cfg["admin_password_hash"]):
+        sys.exit("admin_password_hash is malformed: generate one with  heritage_node.py hash-password")
     return cfg
 
 
@@ -234,6 +270,9 @@ class Node:
         self.index, self.ranked = {}, []
         self.last_sync = None
         self.gc_needed = False
+        self.auth_lock = threading.Lock()
+        self.sessions = {}  # token -> expiry (epoch seconds)
+        self.failures = []  # times of recent failed logins
 
     # -- IPFS -------------------------------------------------------------
 
@@ -565,6 +604,8 @@ class Node:
     # -- web --------------------------------------------------------------
 
     def serve(self):
+        if not self.cfg["admin_password_hash"]:
+            sys.exit("set admin_password_hash in the config first: generate it with  heritage_node.py hash-password")
         token = secrets.token_urlsafe(24)
         host, port = self.cfg["admin_listen"].rsplit(":", 1)
         hosts = {f"{host}:{port}", f"localhost:{port}", f"127.0.0.1:{port}", *self.cfg["admin_hosts"]}
@@ -628,10 +669,66 @@ class AdminHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    COOKIE = "hn_session"
+
+    def session(self):
+        """The caller's valid session token, or None."""
+        try:
+            morsel = SimpleCookie(self.headers.get("Cookie") or "").get(self.COOKIE)
+        except CookieError:
+            return None
+        token = morsel.value if morsel else None
+        node = self.node
+        with node.auth_lock:
+            expiry = node.sessions.get(token)
+            if expiry and expiry > time.time():
+                return token
+            node.sessions.pop(token, None)
+        return None
+
+    def cookie(self, value, max_age):
+        secure = "; Secure" if self.node.cfg["admin_https"] else ""
+        return ("Set-Cookie", f"{self.COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure}")
+
+    def login_page(self, code=200, error=""):
+        msg = f"<p class=bad>{esc(error)}</p>" if error else ""
+        body = ("<h1>Heritage node</h1><form method=post action='/login'>"
+                "<p><label>Password<br><input type=password name=password autofocus autocomplete=current-password "
+                "style='font:inherit;padding:8px;width:min(320px,100%)'></label></p>"
+                f"{msg}<button class=approve>Log in</button></form>")
+        self.send(code, PAGE.format(title="Log in", body=body))
+
+    def login(self, form):
+        node = self.node
+        with node.auth_lock:
+            cutoff = time.time() - LOGIN_WINDOW
+            node.failures = [t for t in node.failures if t > cutoff]
+            locked = len(node.failures) >= LOGIN_FAILURES
+        if locked:
+            return self.login_page(429, "Too many failed attempts. Try again in a few minutes.")
+        if check_password(form.get("password", [""])[0], node.cfg["admin_password_hash"]):
+            token = secrets.token_urlsafe(32)
+            max_age = int(node.cfg["session_hours"] * 3600)
+            with node.auth_lock:
+                now_ts = time.time()
+                node.sessions = {t: e for t, e in node.sessions.items() if e > now_ts}
+                node.sessions[token] = now_ts + max_age
+            log("admin login")
+            return self.send(303, "", extra=[("Location", "/"), self.cookie(token, max_age)])
+        with node.auth_lock:
+            node.failures.append(time.time())
+        log("failed admin login")
+        time.sleep(1)
+        self.login_page(401, "Wrong password.")
+
     def do_GET(self):
         if not self.allowed():
             return
         path = urlparse(self.path).path
+        if path == "/login":
+            return self.login_page()
+        if not self.session():
+            return self.send(303, "", extra=[("Location", "/login")])
         if path == "/":
             return self.send(200, self.status_page())
         if m := re.fullmatch(r"/review/([0-9a-f]{40})", path):
@@ -643,13 +740,28 @@ class AdminHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
-        m = re.fullmatch(r"/review/([0-9a-f]{40})", urlparse(self.path).path)
-        length = int(self.headers.get("Content-Length") or 0)
-        if not m or length > 10_000:
+        path = urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 10_000:
             return self.send(400, "bad request", "text/plain")
-        form = parse_qs(self.rfile.read(length).decode())
+        form = parse_qs(self.rfile.read(length).decode(errors="replace"))
+        if path == "/login":
+            return self.login(form)
+        session = self.session()
+        if not session:
+            return self.send(303, "", extra=[("Location", "/login")])
         if not secrets.compare_digest(form.get("token", [""])[0], self.token):
             return self.send(403, "bad token: reload the page", "text/plain")
+        if path == "/logout":
+            with self.node.auth_lock:
+                self.node.sessions.pop(session, None)
+            return self.send(303, "", extra=[("Location", "/login"), self.cookie("", 0)])
+        m = re.fullmatch(r"/review/([0-9a-f]{40})", path)
+        if not m:
+            return self.send(404, "not found", "text/plain")
         action = form.get("action", [""])[0]
         if action not in ("approve", "reject"):
             return self.send(400, "bad action", "text/plain")
@@ -692,7 +804,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             f"<td>{esc(p['author'])}</td><td>{len(p['entries'])}</td><td class=bad>{esc(p['problems'][0])}</td></tr>"
             for sha, p in st["pending"].items()) or "<tr><td colspan=5 class=muted>Nothing to review.</td></tr>"
         pct = min(100, 100 * used / cap) if cap else 0
-        body = (f"<h1>Heritage node</h1><p>{human(used)} of {human(cap)} used · {len(st['pins'])} photos pinned · "
+        logout = (f"<form method=post action='/logout' style='float:right'><input type=hidden name=token "
+                  f"value='{esc(self.token)}'><button>Log out</button></form>")
+        body = (f"{logout}<h1>Heritage node</h1><p>{human(used)} of {human(cap)} used · {len(st['pins'])} photos pinned · "
                 f"last sync {esc(node.last_sync or 'not yet')}</p><div class=bar><span style='width:{pct:.1f}%'></span></div>"
                 f"<h2>Waiting for review</h2><table><tr><th>Commit</th><th>Site</th><th>Author</th><th>New photos</th><th>Why</th></tr>{pending}</table>"
                 f"<h2>Sites by preference</h2><table><tr><th>#</th><th>Site</th><th>Status</th><th>Hosted</th><th>Approved</th></tr>{''.join(rows)}</table>")
@@ -766,9 +880,19 @@ class PublicHandler(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["run", "sync", "rank"])
-    p.add_argument("--config", required=True)
+    p.add_argument("command", choices=["run", "sync", "rank", "hash-password"])
+    p.add_argument("--config")
     args = p.parse_args()
+    if args.command == "hash-password":
+        password = getpass.getpass("New admin password: ")
+        if len(password) < 12:
+            sys.exit("use at least 12 characters")
+        if getpass.getpass("Again: ") != password:
+            sys.exit("passwords differ")
+        print(f'admin_password_hash = "{hash_password(password)}"')
+        return
+    if not args.config:
+        p.error("--config is required")
     node = Node(load_config(args.config))
     if args.command == "rank":
         index = node.load_index()

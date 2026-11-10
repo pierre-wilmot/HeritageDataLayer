@@ -33,6 +33,14 @@ admin_listen = "127.0.0.1:8090"
 # Extra Host headers the UI accepts, e.g. ["heritage-node.local:8090"] on a LAN.
 admin_hosts = []
 
+# Required: the UI is password protected. Generate the line with
+#   python3 heritage_node.py hash-password
+admin_password_hash = ""
+# Set to true when the UI is served over HTTPS (e.g. behind nginx), so the
+# session cookie is only ever sent encrypted.
+admin_https = false
+session_hours = 12
+
 # Read-only public mirror of the approved git history ("" = off),
 # e.g. "0.0.0.0:8091". Clone with: git clone http://<node>:8091/git/<site>.git
 public_listen = ""

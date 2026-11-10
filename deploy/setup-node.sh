@@ -10,6 +10,8 @@
 #
 # Override ports if something else on the machine already uses IPFS's defaults:
 #   IPFS_SWARM_PORT=4001 IPFS_API_PORT=5001 IPFS_GATEWAY_PORT=8080
+# Cap Kubo's memory on small machines:  IPFS_MAX_MEMORY=512MB
+# A random review-UI password is generated and printed on first install.
 set -euo pipefail
 
 SIGNERS="${1:?usage: setup-node.sh ALLOWED_SIGNERS_FILE}"
@@ -57,6 +59,9 @@ as_heritage ipfs config Addresses.API "/ip4/127.0.0.1/tcp/$API"
 as_heritage ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/$GATEWAY"   # never an open gateway
 as_heritage ipfs config --json Addresses.Swarm \
   "[\"/ip4/0.0.0.0/tcp/$SWARM\",\"/ip6/::/tcp/$SWARM\",\"/ip4/0.0.0.0/udp/$SWARM/quic-v1\",\"/ip6/::/udp/$SWARM/quic-v1\"]"
+if [ -n "${IPFS_MAX_MEMORY:-}" ]; then   # e.g. 512MB on small machines
+  as_heritage ipfs config Swarm.ResourceMgr.MaxMemory "$IPFS_MAX_MEMORY"
+fi
 
 echo "==> config"
 if [ ! -f "$ETC/node.toml" ]; then
@@ -66,6 +71,14 @@ if [ ! -f "$ETC/node.toml" ]; then
       "$SRC/node.example.toml" > "$ETC/node.toml"
   echo "    wrote $ETC/node.toml: edit max_storage and favourites"
 fi
+if grep -q '^admin_password_hash = ""' "$ETC/node.toml"; then
+  PW=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
+  HASH=$(python3 -c "import sys; sys.path.insert(0, '$CODE'); from heritage_node import hash_password; print(hash_password(sys.stdin.read().strip()))" <<<"$PW" | tr -d '\n')
+  sed -i "s#^admin_password_hash = \"\"#admin_password_hash = \"$HASH\"#" "$ETC/node.toml"
+  echo "    review UI password: $PW"
+  echo "    (shown once; to change it: python3 $CODE/heritage_node.py hash-password, then edit $ETC/node.toml)"
+fi
+chown root:heritage "$ETC/node.toml" && chmod 640 "$ETC/node.toml"
 
 echo "==> services"
 cat > /etc/systemd/system/heritage-ipfs.service <<EOF
