@@ -159,8 +159,11 @@ def save(repo, doc):
     (Path(repo) / FILE).write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
 
 
-def add_photos(repo, files, key):
-    """Pin each file, sign it, record it. Returns [(status, name, cid)]."""
+def add_photos(repo, files, key, omit=()):
+    """Pin each file, sign it, record it. Returns [(status, name, cid)].
+
+    Metadata fields named in omit (e.g. "taken" when the camera clock is
+    wrong) are left out of new entries."""
     doc = load(repo)
     site, photos = doc["site"], doc["photos"]
     by_cid = {p["cid"]: p for p in photos}
@@ -170,7 +173,8 @@ def add_photos(repo, files, key):
         cid = run("ipfs", "add", "-Q", "--pin", "--cid-version=1", path)
         entry = by_cid.get(cid)
         if entry is None:
-            entry = {"cid": cid, "meta": metadata(path), "signatures": []}
+            meta = {k: v for k, v in metadata(path).items() if k not in omit}
+            entry = {"cid": cid, "meta": meta, "signatures": []}
             photos.append(entry)
             by_cid[cid] = entry
             status, role = "added", "contributor"
@@ -217,7 +221,7 @@ def cmd_seed(args):
     doc.update({"lat": args.lat, "lon": args.lon, "photos": []})
     save(repo, doc)
     commit(repo, args.key, f"Genesis: {args.name or site['value']} ({site['scheme']}:{site['value']})")
-    n = report(add_photos(repo, args.files, args.key))
+    n = report(add_photos(repo, args.files, args.key, args.omit))
     if n:
         commit(repo, args.key, f"Add {n} photo{'s' * (n != 1)}")
     print(f"seeded {repo}")
@@ -231,7 +235,7 @@ def cmd_add(args):
         run("git", "pull", "-q", "--ff-only", cwd=repo)
     else:
         run("git", "clone", "-q", args.url, repo)
-    n = report(add_photos(repo, args.files, args.key))
+    n = report(add_photos(repo, args.files, args.key, args.omit))
     if n and commit(repo, args.key, f"Add {n} photo{'s' * (n != 1)}") and args.push:
         run("git", "push", "-q", cwd=repo)
         print("pushed")
@@ -270,6 +274,8 @@ def main():
     s.add_argument("--lon", type=float, required=True)
     s.add_argument("--name")
     s.add_argument("--dir")
+    s.add_argument("--omit", action="append", default=[], metavar="FIELD",
+                   help="leave a metadata field out, e.g. --omit taken (repeatable)")
     s.add_argument("files", nargs="+")
     s.set_defaults(func=cmd_seed)
 
@@ -277,6 +283,8 @@ def main():
     a.add_argument("url")
     a.add_argument("--dir")
     a.add_argument("--push", action="store_true")
+    a.add_argument("--omit", action="append", default=[], metavar="FIELD",
+                   help="leave a metadata field out, e.g. --omit taken (repeatable)")
     a.add_argument("files", nargs="+")
     a.set_defaults(func=cmd_add)
 

@@ -129,6 +129,11 @@ For every file, `seed` and `add`:
 `add` pushes only when given `--push`. It refuses to run on a working copy
 with uncommitted changes.
 
+`--omit FIELD` (repeatable, on `seed` and `add`) leaves a metadata field out of
+new entries, e.g. `--omit taken` when the camera clock was never set, or
+`--omit gps` to keep a location private. Because metadata is signed, a field
+cannot be dropped later without re-signing, so decide before adding.
+
 `verify` reports each photo as trusted, untrusted (no signature from a key in
 your file) or bad (a signature that does not match its key, site, CID or
 metadata), and exits non-zero if any signature is bad.
