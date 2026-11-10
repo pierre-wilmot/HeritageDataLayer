@@ -185,6 +185,21 @@ def image_type(head):
     return None
 
 
+def make_thumbnail(data, size=480):
+    """Small JPEG preview. Needs Pillow (python3-pil); raises ImportError without it."""
+    import io
+    from PIL import Image, ImageOps
+
+    Image.MAX_IMAGE_PIXELS = 150_000_000  # refuse decompression bombs
+    with Image.open(io.BytesIO(data)) as im:
+        im.draft("RGB", (size * 2, size * 2))  # fast downscale while decoding JPEGs
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((size, size))
+        out = io.BytesIO()
+        im.convert("RGB").save(out, "JPEG", quality=80)
+    return out.getvalue()
+
+
 def read_doc(work, sha):
     """photos.json at a commit: (doc, None) or (None, problem)."""
     entry = git("ls-tree", sha, "--", FILE, cwd=work)
@@ -270,6 +285,7 @@ class Node:
         self.index, self.ranked = {}, []
         self.last_sync = None
         self.gc_needed = False
+        self.wanted = set()  # CIDs the last sync planned to host
         self.auth_lock = threading.Lock()
         self.sessions = {}  # token -> expiry (epoch seconds)
         self.failures = []  # times of recent failed logins
@@ -538,10 +554,13 @@ class Node:
                 if "not pinned" not in str(e):
                     log(f"unpin {cid}: {e}")
                     continue
-            del state["pins"][cid]
+            with state.lock:
+                del state["pins"][cid]
+            self.drop_thumbs([cid])
         if dropped:
             log(f"unpinned {len(dropped)} photo(s)")
             state.save()
+        self.wanted = set(wanted)
         if dropped or self.gc_needed:
             self.ipfs("repo", "gc", "--quiet")
             self.gc_needed = False
@@ -561,20 +580,94 @@ class Node:
                 continue
             self.ipfs("pin", "add", "--name=heritage-node", cid)
             size = int(self.ipfs("files", "stat", "--format=<cumulsize>", f"/ipfs/{cid}"))
-            state["pins"][cid] = {"site": w["site"], "bytes": size, "file_bytes": w["bytes"], "since": now()}
+            with state.lock:
+                state["pins"][cid] = {"site": w["site"], "bytes": size, "file_bytes": w["bytes"], "since": now()}
             state.save()
 
-        for key in ranked:
-            st = state["sites"].get(key, {})
-            pins = [p for p in state["pins"].values() if p["site"] == key]
-            st["hosted_photos"], st["hosted_bytes"] = len(pins), sum(p["bytes"] for p in pins)
-            st["unavailable"] = unavailable.get(key, 0)
+        with state.lock:
+            for key in ranked:
+                st = state["sites"].get(key, {})
+                pins = [p for p in state["pins"].values() if p["site"] == key]
+                st["hosted_photos"], st["hosted_bytes"] = len(pins), sum(p["bytes"] for p in pins)
+                st["unavailable"] = unavailable.get(key, 0)
         self.last_sync = now()
         state.save()
         log(f"sync done: {human(self.used())} of {human(budget)} used, {len(state['pins'])} photo(s) pinned")
 
     def used(self):
-        return sum(p["bytes"] for p in self.state["pins"].values())
+        with self.state.lock:
+            return sum(p["bytes"] for p in self.state["pins"].values())
+
+    # -- what the dashboard shows -----------------------------------------
+
+    def thumb_path(self, cid):
+        return self.dir / "thumbs" / f"{cid}.jpg"
+
+    def drop_thumbs(self, cids):
+        for cid in cids:
+            self.thumb_path(cid).unlink(missing_ok=True)
+
+    def expected_size(self, cid):
+        """Signed size of a photo the dashboard may show (under review or hosted), else None."""
+        with self.state.lock:
+            for p in self.state["pending"].values():
+                for e in p["entries"]:
+                    if e["cid"] == cid:
+                        return e["meta"]["bytes"]
+            pin = self.state["pins"].get(cid)
+            return pin.get("file_bytes") if pin else None
+
+    def thumbnail(self, cid):
+        """(content type, data, problem) for a small preview, cached on disk.
+
+        Without Pillow (python3-pil) the full photo is returned instead."""
+        path = self.thumb_path(cid)
+        if path.is_file():
+            return "image/jpeg", path.read_bytes(), None
+        expected = self.expected_size(cid)
+        if not expected or expected > self.cfg["max_photo_bytes"]:
+            return None, None, "not a photo under review or hosted"
+        kind, data, problem, _ = self.fetch_photo(cid, expected, keep=True)
+        if problem:
+            return None, None, f"photo {problem}"
+        try:
+            thumb = make_thumbnail(data)
+        except ImportError:
+            return kind, data, None
+        except Exception as e:  # undecodable or oversized image: show nothing
+            return None, None, f"cannot make a preview: {e}"
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(thumb)
+        os.replace(tmp, path)
+        return "image/jpeg", thumb, None
+
+    def site_view(self, key):
+        """(approved photos.json or None, rows) describing what is hosted for a site."""
+        st = self.state["sites"].get(key, {})
+        approved = st.get("approved")
+        if not approved:
+            return None, []
+        doc, err = read_doc(self.site_dir(key) / "work.git", approved)
+        if err:
+            return None, []
+        rows = []
+        with self.state.lock:
+            for e in sorted(doc["photos"], key=lambda e: (e["meta"].get("name", ""), e["cid"])):
+                cid, meta = e["cid"], e["meta"]
+                pin, bad = self.state["pins"].get(cid), self.state["bad_cids"].get(cid)
+                if pin:
+                    reason = None
+                elif bad:
+                    reason = f"rejected: {bad['problem']}"
+                elif meta["bytes"] > self.cfg["max_photo_bytes"]:
+                    reason = "larger than max_photo_bytes"
+                elif cid in self.wanted:
+                    reason = "not fetched yet (unavailable on IPFS)"
+                else:
+                    reason = "storage cap reached"
+                rows.append({"cid": cid, "meta": meta, "pin": pin, "reason": reason})
+        return doc, rows
 
     def review(self, sha, action):
         with self.state.lock:
@@ -587,6 +680,7 @@ class Node:
             else:
                 self.state["rejected"][sha] = record
                 self.gc_needed = True  # drop the cached blocks we fetched for review
+                self.drop_thumbs(e["cid"] for e in p["entries"] if e["cid"] not in self.state["pins"])
             self.state.save()
         log(f"{p['site']}: commit {sha[:10]} {action}d by maintainer")
         self.wake.set()
@@ -735,6 +829,13 @@ class AdminHandler(BaseHTTPRequestHandler):
             return self.review_page(m.group(1))
         if m := re.fullmatch(r"/photo/(b[a-z2-7]{50,100})", path):
             return self.photo(m.group(1))
+        if m := re.fullmatch(r"/thumb/(b[a-z2-7]{50,100})", path):
+            kind, data, problem = self.node.thumbnail(m.group(1))
+            if problem:
+                return self.send(404, problem, "text/plain")
+            return self.send(200, data, kind, extra=[("Cache-Control", "private, max-age=86400")])
+        if m := re.fullmatch(r"/site/([a-z0-9][a-z0-9-]*:[A-Za-z0-9._-]+)", path):
+            return self.site_page(m.group(1))
         self.send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -769,21 +870,42 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send(303, "", extra=[("Location", "/")])
 
     def photo(self, cid):
-        st = self.node.state
-        with st.lock:
-            expected = None
-            for p in st["pending"].values():
-                for e in p["entries"]:
-                    if e["cid"] == cid:
-                        expected = e["meta"]["bytes"]
-            if expected is None and cid in st["pins"]:
-                expected = st["pins"][cid].get("file_bytes")
+        expected = self.node.expected_size(cid)
         if not expected or expected > self.node.cfg["max_photo_bytes"]:
-            return self.send(404, "not a photo under review", "text/plain")
+            return self.send(404, "not a photo under review or hosted", "text/plain")
         kind, data, problem, _ = self.node.fetch_photo(cid, expected, keep=True)
         if problem:
             return self.send(502, f"photo {problem}", "text/plain")
         self.send(200, data, kind, extra=[("Cache-Control", "private, max-age=3600")])
+
+    def site_page(self, key):
+        node = self.node
+        s = node.state["sites"].get(key)
+        doc, rows = node.site_view(key) if s else (None, [])
+        if not doc:
+            return self.send(404, PAGE.format(title="Not found", body="<p>Nothing approved for this site yet. <a href='/'>Back</a></p>"))
+        hosted = [r for r in rows if r["pin"]]
+        missing = [r for r in rows if not r["pin"]]
+        lat, lon = doc["lat"], doc["lon"]
+        cards = "".join(
+            f"<div class=card><a href='/photo/{esc(r['cid'])}'><img loading=lazy src='/thumb/{esc(r['cid'])}' alt=''></a>"
+            f"<b>{esc(r['meta'].get('name', ''))}</b> · {human(r['meta']['bytes'])}<br>"
+            f"{esc(r['meta'].get('license', ''))} · {esc(r['meta'].get('author', ''))}"
+            f"{'<br>source: ' + esc(r['meta']['source']) if r['meta'].get('source') else ''}"
+            f"<br><code>{esc(r['cid'])}</code><br><span class=muted>pinned {esc(r['pin'].get('since', ''))}</span></div>"
+            for r in hosted)
+        missing_rows = "".join(
+            f"<tr><td>{esc(r['meta'].get('name', ''))}</td><td>{human(r['meta']['bytes'])}</td>"
+            f"<td>{esc(r['reason'])}</td><td><code>{esc(r['cid'])}</code></td></tr>" for r in missing)
+        missing_html = (f"<h2>Approved but not hosted ({len(missing)})</h2><table><tr><th>Photo</th><th>Size</th>"
+                        f"<th>Why</th><th>CID</th></tr>{missing_rows}</table>") if missing else ""
+        body = (f"<p><a href='/'>← all sites</a></p><h1>{esc(doc.get('name', key))}</h1>"
+                f"<p><code>{esc(key)}</code> · <a href='https://www.openstreetmap.org/?mlat={lat}&amp;mlon={lon}#map=17/{lat}/{lon}' "
+                f"rel=noreferrer>{lat}, {lon}</a><br>repo {esc(node.index.get(key, ''))}<br>"
+                f"approved up to <code>{esc(s['approved'][:10])}</code> · {esc(s.get('status', ''))}</p>"
+                f"<p><b>Hosting {len(hosted)} of {len(rows)} photos</b>, {human(sum(r['pin']['bytes'] for r in hosted))}</p>"
+                f"<div class=grid>{cards or '<p class=muted>No photos hosted.</p>'}</div>{missing_html}")
+        self.send(200, PAGE.format(title=doc.get("name", key), body=body))
 
     def status_page(self):
         node, st = self.node, self.node.state
@@ -796,7 +918,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             status = s.get("status", "not synced yet")
             cls = "bad" if status.startswith(("error", "blocked", "frozen", "waiting")) else "muted"
             unavailable = f", {s['unavailable']} unavailable" if s.get("unavailable") else ""
-            rows.append(f"<tr><td>{i}</td><td><code>{esc(key)}</code>{fav}<br><span class=muted>{esc(node.index.get(key, ''))}</span></td>"
+            link = f"<a href='/site/{esc(key)}'><code>{esc(key)}</code></a>" if s.get("approved") else f"<code>{esc(key)}</code>"
+            rows.append(f"<tr><td>{i}</td><td>{link}{fav}<br><span class=muted>{esc(node.index.get(key, ''))}</span></td>"
                         f"<td class={cls}>{esc(status)}</td><td>{s.get('hosted_photos', 0)} photos, {human(s.get('hosted_bytes', 0))}{unavailable}</td>"
                         f"<td><code>{esc((s.get('approved') or '')[:10])}</code></td></tr>")
         pending = "".join(
@@ -826,7 +949,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 f"{esc(s['role'])}: {'trusted (' + esc(s['trusted_by']) + ')' if s['trusted_by'] else ('INVALID' if not s['valid'] else 'valid, not whitelisted')}"
                 f"<br><code>{esc(s['key'][:32])}…</code></div>"
                 for s in p["signatures"].get(e["cid"], []))
-            cards.append(f"<div class=card><img loading=lazy src='/photo/{esc(e['cid'])}' alt=''>"
+            cards.append(f"<div class=card><a href='/photo/{esc(e['cid'])}'><img loading=lazy src='/thumb/{esc(e['cid'])}' alt=''></a>"
                          f"<b>{esc(m.get('name', ''))}</b> · {human(m.get('bytes', 0))}<br>{esc(m.get('license', 'no license'))} · {esc(m.get('author', ''))}"
                          f"{'<br>source: ' + esc(m['source']) if m.get('source') else ''}<br><code>{esc(e['cid'])}</code>{sigs}</div>")
         problems = "".join(f"<li>{esc(x)}</li>" for x in p["problems"])
