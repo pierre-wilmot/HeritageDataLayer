@@ -128,7 +128,7 @@ systemctl enable --now heritage-ipfs.service
 systemctl enable heritage-node.service
 systemctl restart heritage-node.service
 
-if command -v ufw >/dev/null && ufw status | grep -q active; then
+if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$SWARM/tcp" >/dev/null && ufw allow "$SWARM/udp" >/dev/null
   echo "    opened IPFS port $SWARM in ufw"
 fi
