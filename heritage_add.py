@@ -4,11 +4,18 @@
 One git repo per site. photos.json at its root holds the site identity, its
 location, and every photo CID with metadata and contributor signatures.
 
-  heritage_add.py seed <scheme:id> --lat LAT --lon LON [--name NAME] [--dir DIR] FILE...
-  heritage_add.py add <git-url-or-path> [--dir DIR] [--push] FILE...
+  heritage_add.py seed <scheme:id> --lat LAT --lon LON [--name NAME] [--dir DIR] PHOTO_OPTS FILE...
+  heritage_add.py add <git-url-or-path> [--dir DIR] [--push] PHOTO_OPTS FILE...
   heritage_add.py verify <repo-dir> --allowed-signers FILE
 
+  PHOTO_OPTS: --license SPDX [--author NAME] [--source URL] [--omit FIELD]...
+
 <scheme:id> is e.g. historic-england-nhle:1322326 (a bare id means NHLE).
+
+Every photo carries a signed license. Only licenses whose photos can be
+combined into a CC BY-SA 4.0 work (e.g. a 3D model) are accepted; --author
+(the attribution name) is required unless the license is CC0 or public domain,
+and public domain photos need a --source explaining why.
 
 Each signature is an SSH signature (ssh-keygen -Y sign, namespace
 "heritage-photo") over:
@@ -33,6 +40,30 @@ TYPE = "heritage-photos/v1"
 NAMESPACE = "heritage-photo"
 FILE = "photos.json"
 DEFAULT_KEY = Path.home() / ".ssh" / "heritage_signing_ed25519"
+
+# SPDX ids. Everything here can go into a CC BY-SA 4.0 adaptation: no NC/ND.
+LICENSES = {
+    "CC0-1.0",
+    "CC-BY-2.0", "CC-BY-2.5", "CC-BY-3.0", "CC-BY-4.0",
+    "CC-BY-SA-2.0", "CC-BY-SA-2.5", "CC-BY-SA-3.0", "CC-BY-SA-4.0",
+    "OGL-UK-3.0",
+    "LicenseRef-PublicDomain",  # copyright expired; source must say why
+}
+NO_ATTRIBUTION = {"CC0-1.0", "LicenseRef-PublicDomain"}
+
+
+def license_problem(meta):
+    """Why this metadata's licensing is unacceptable, or None if it is fine."""
+    lic = meta.get("license")
+    if lic is None:
+        return "no license"
+    if lic not in LICENSES:
+        return f"license {lic!r} not accepted"
+    if lic not in NO_ATTRIBUTION and not meta.get("author"):
+        return f"{lic} requires an author"
+    if lic == "LicenseRef-PublicDomain" and not meta.get("source"):
+        return "public domain needs a source"
+    return None
 
 
 def run(*cmd, cwd=None):
@@ -159,11 +190,12 @@ def save(repo, doc):
     (Path(repo) / FILE).write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
 
 
-def add_photos(repo, files, key, omit=()):
+def add_photos(repo, files, key, rights, omit=()):
     """Pin each file, sign it, record it. Returns [(status, name, cid)].
 
+    rights ({"license", "author"?, "source"?}) is added to new entries.
     Metadata fields named in omit (e.g. "taken" when the camera clock is
-    wrong) are left out of new entries."""
+    wrong) are left out of them. Existing entries keep their metadata."""
     doc = load(repo)
     site, photos = doc["site"], doc["photos"]
     by_cid = {p["cid"]: p for p in photos}
@@ -174,6 +206,7 @@ def add_photos(repo, files, key, omit=()):
         entry = by_cid.get(cid)
         if entry is None:
             meta = {k: v for k, v in metadata(path).items() if k not in omit}
+            meta.update(rights)
             entry = {"cid": cid, "meta": meta, "signatures": []}
             photos.append(entry)
             by_cid[cid] = entry
@@ -221,7 +254,7 @@ def cmd_seed(args):
     doc.update({"lat": args.lat, "lon": args.lon, "photos": []})
     save(repo, doc)
     commit(repo, args.key, f"Genesis: {args.name or site['value']} ({site['scheme']}:{site['value']})")
-    n = report(add_photos(repo, args.files, args.key, args.omit))
+    n = report(add_photos(repo, args.files, args.key, args.rights, args.omit))
     if n:
         commit(repo, args.key, f"Add {n} photo{'s' * (n != 1)}")
     print(f"seeded {repo}")
@@ -235,7 +268,7 @@ def cmd_add(args):
         run("git", "pull", "-q", "--ff-only", cwd=repo)
     else:
         run("git", "clone", "-q", args.url, repo)
-    n = report(add_photos(repo, args.files, args.key, args.omit))
+    n = report(add_photos(repo, args.files, args.key, args.rights, args.omit))
     if n and commit(repo, args.key, f"Add {n} photo{'s' * (n != 1)}") and args.push:
         run("git", "push", "-q", cwd=repo)
         print("pushed")
@@ -246,6 +279,10 @@ def cmd_verify(args):
     doc = load(args.repo)
     bad = untrusted = ok = 0
     for entry in doc["photos"]:
+        problem = license_problem(entry["meta"])
+        if problem:
+            bad += 1
+            print(f"LICENSE {entry['cid']} {entry['meta'].get('name', '')}: {problem}")
         trusted_by = []
         for s in entry["signatures"]:
             valid, principal = check_signature(doc["site"], entry, s, args.allowed_signers)
@@ -259,8 +296,17 @@ def cmd_verify(args):
         else:
             untrusted += 1
             print(f"UNTRUSTED {entry['cid']} {entry['meta'].get('name', '')}")
-    print(f"{ok} trusted, {untrusted} untrusted, {bad} bad signature(s)")
+    print(f"{ok} trusted, {untrusted} untrusted, {bad} problem(s) (bad signature or license)")
     sys.exit(1 if bad else 0)
+
+
+def photo_args(parser):
+    parser.add_argument("--license", required=True, choices=sorted(LICENSES), metavar="SPDX",
+                        help="license of these photos, e.g. CC-BY-SA-4.0 (one of: %(choices)s)")
+    parser.add_argument("--author", help="attribution name (required unless CC0 or public domain)")
+    parser.add_argument("--source", help="where the photos come from, if imported (URL)")
+    parser.add_argument("--omit", action="append", default=[], metavar="FIELD",
+                        help="leave a metadata field out, e.g. --omit taken (repeatable)")
 
 
 def main():
@@ -274,8 +320,7 @@ def main():
     s.add_argument("--lon", type=float, required=True)
     s.add_argument("--name")
     s.add_argument("--dir")
-    s.add_argument("--omit", action="append", default=[], metavar="FIELD",
-                   help="leave a metadata field out, e.g. --omit taken (repeatable)")
+    photo_args(s)
     s.add_argument("files", nargs="+")
     s.set_defaults(func=cmd_seed)
 
@@ -283,8 +328,7 @@ def main():
     a.add_argument("url")
     a.add_argument("--dir")
     a.add_argument("--push", action="store_true")
-    a.add_argument("--omit", action="append", default=[], metavar="FIELD",
-                   help="leave a metadata field out, e.g. --omit taken (repeatable)")
+    photo_args(a)
     a.add_argument("files", nargs="+")
     a.set_defaults(func=cmd_add)
 
@@ -294,6 +338,10 @@ def main():
     v.set_defaults(func=cmd_verify)
 
     args = p.parse_args()
+    if args.cmd in ("seed", "add"):
+        args.rights = {k: v for k in ("license", "author", "source") if (v := getattr(args, k))}
+        if problem := license_problem(args.rights):
+            p.error(problem)
     args.key = args.key.expanduser().resolve()  # git runs inside the repo dir
     if not args.key.exists() or not Path(f"{args.key}.pub").exists():
         sys.exit(f"need both {args.key} and {args.key}.pub")

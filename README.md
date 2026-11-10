@@ -50,7 +50,9 @@ The root of every site repository holds a single file:
         "bytes": 4328580,
         "taken": "2025-01-12T14:03:11Z",
         "camera": "Canon EOS 60D",
-        "pixels": [5184, 3456]
+        "pixels": [5184, 3456],
+        "license": "CC-BY-SA-4.0",
+        "author": "Jane Smith"
       },
       "signatures": [
         {"key": "ssh-ed25519 AAAAC3...", "role": "contributor", "sig": "U1NIU0lH..."},
@@ -68,6 +70,41 @@ The root of every site repository holds a single file:
   than what was vouched for.
 - **Public keys are stored without their comment**, which usually holds an email
   address.
+- **Every photo carries its own license**, inside the signed metadata (see
+  [Licensing](#licensing)).
+
+### Licensing
+
+A site mixes photos from many people and sources, so the license belongs to
+each photo, not to the site:
+
+- `license`: an [SPDX identifier](https://spdx.org/licenses/), e.g. `CC-BY-SA-4.0`;
+- `author`: the name to credit, which need not match the signing key (an
+  importer signs, the original photographer is credited);
+- `source`: for imported photos, where the original license is stated.
+
+Because they sit in the signed metadata, the contributor's signature doubles as
+the claim "I have the right to release this under this license", and nobody can
+change the license afterwards.
+
+**Accepted licenses** are those whose photos can be combined into a
+CC BY-SA 4.0 work, such as a 3D model built from them:
+
+| License | Notes |
+|---|---|
+| `CC0-1.0` | No conditions. |
+| `CC-BY-2.0`, `CC-BY-2.5`, `CC-BY-3.0`, `CC-BY-4.0` | Credit required. |
+| `CC-BY-SA-2.0`, `CC-BY-SA-2.5`, `CC-BY-SA-3.0`, `CC-BY-SA-4.0` | Credit and share-alike. Covers Wikimedia Commons and Wiki Loves Monuments uploads, and Geograph Britain and Ireland (CC BY-SA 2.0). Older versions allow adaptations under later ones. |
+| `OGL-UK-3.0` | UK Open Government Licence, compatible with CC BY. |
+| `LicenseRef-PublicDomain` | Copyright expired (e.g. historic photographs). `source` must say why. |
+
+**Rejected:** NonCommercial (NC) licenses cannot be combined with BY-SA, and
+NoDerivatives (ND) licenses forbid building a model at all. GFDL-only files
+and anything without a license are rejected too.
+
+`author` is required unless the license is CC0 or public domain. A model built
+from a mix of these photos is CC BY-SA 4.0, and its credits can be generated from
+each photo's `author`, `license` and `source`.
 
 ### What a signature covers
 
@@ -110,10 +147,17 @@ macOS Spotlight, photo metadata is read with Pillow (`pip install Pillow`).
 ```bash
 # Start a new site: creates the repo and its first commit, then adds the photos
 python3 heritage_add.py seed historic-england-nhle:1322326 \
-    --lat 51.5413 --lon 0.6542 --name "Church of St Clement" photos/*.JPG
+    --lat 51.5413 --lon 0.6542 --name "Church of St Clement" \
+    --license CC-BY-SA-4.0 --author "Jane Smith" photos/*.JPG
 
 # Contribute to an existing site: clones it (or updates an existing copy)
-python3 heritage_add.py add https://example.org/sites/1322326.git --push photos/*.JPG
+python3 heritage_add.py add https://example.org/sites/1322326.git --push \
+    --license CC-BY-4.0 --author "Jane Smith" photos/*.JPG
+
+# Import a photo from elsewhere, crediting its original author
+python3 heritage_add.py add https://example.org/sites/1322326.git \
+    --license CC-BY-SA-2.0 --author "John Doe" \
+    --source https://www.geograph.org.uk/photo/1234567 photo.jpg
 
 # Check every signature against your own trust list
 python3 heritage_add.py verify 1322326 --allowed-signers ~/.ssh/allowed_signers
@@ -134,9 +178,13 @@ new entries, e.g. `--omit taken` when the camera clock was never set, or
 `--omit gps` to keep a location private. Because metadata is signed, a field
 cannot be dropped later without re-signing, so decide before adding.
 
+`--license` is required on `seed` and `add` and applies to every file in that
+run; `--author` and `--source` likewise.
+
 `verify` reports each photo as trusted, untrusted (no signature from a key in
 your file) or bad (a signature that does not match its key, site, CID or
-metadata), and exits non-zero if any signature is bad.
+metadata), flags missing or disallowed licenses, and exits non-zero if it finds
+any bad signature or license.
 
 The signing key defaults to `~/.ssh/heritage_signing_ed25519`; use `--key` for
 another. To create one:
