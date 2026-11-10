@@ -237,8 +237,28 @@ kept at home or in a site's ticket office.
    garbage-collected. Each photo is fetched with a hard byte cap and must match
    its signed size and look like an image before it is pinned.
 
-The review UI listens on localhost only. Reach it through an SSH tunnel:
-`ssh -L 8090:127.0.0.1:8090 <node>`, then open http://127.0.0.1:8090/.
+**The review UI** is password protected: the password is stored as a scrypt
+hash (`heritage_node.py hash-password`), sessions use `HttpOnly`,
+`SameSite=Strict` cookies, and logins lock after 10 failures in 10 minutes.
+`setup-node.sh` generates and prints a random password on first install.
+
+The UI itself listens on localhost only, so it is never exposed over plain HTTP.
+Reach it either through an SSH tunnel (`ssh -L 8090:127.0.0.1:8090 <node>`,
+then http://127.0.0.1:8090/), or publish it over HTTPS with a reverse proxy:
+
+```nginx
+server {
+    server_name node.example.org;
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+then `sudo certbot --nginx -d node.example.org`, and in `node.toml` set
+`admin_hosts = ["node.example.org"]` and `admin_https = true` (cookies are then
+only sent over HTTPS). Rate limiting `/login` in nginx is a good extra layer.
 
 **Install** on Debian, Ubuntu or Raspberry Pi OS:
 
