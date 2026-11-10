@@ -272,6 +272,12 @@ journalctl -u heritage-node -f
 The node needs IPFS port 4001 (tcp and udp) reachable for others to fetch the
 photos it pins.
 
+Kubo's own disk use is capped separately by `IPFS_STORAGE_MAX` (default `10GB`,
+set when running `setup-node.sh`): cached, unpinned blocks are garbage-collected
+hourly once the repo nears that limit, while pinned photos are never removed.
+Keep it comfortably above `max_storage`. On small machines `IPFS_MAX_MEMORY`
+(e.g. `512MB`) caps Kubo's memory.
+
 **Not yet covered:** known-CSAM hash matching and image classification before
 review, a signed revocation list, and re-encoding photos to neutralise hidden
 data. Until then, a maintainer sees every photo that is not signed by a trusted

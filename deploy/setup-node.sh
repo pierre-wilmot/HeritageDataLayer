@@ -11,6 +11,7 @@
 # Override ports if something else on the machine already uses IPFS's defaults:
 #   IPFS_SWARM_PORT=4001 IPFS_API_PORT=5001 IPFS_GATEWAY_PORT=8080
 # Cap Kubo's memory on small machines:  IPFS_MAX_MEMORY=512MB
+# Cap Kubo's disk use (pins are never collected; cached blocks are, hourly):  IPFS_STORAGE_MAX=10GB
 # A random review-UI password is generated and printed on first install.
 set -euo pipefail
 
@@ -59,6 +60,10 @@ as_heritage ipfs config Addresses.API "/ip4/127.0.0.1/tcp/$API"
 as_heritage ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/$GATEWAY"   # never an open gateway
 as_heritage ipfs config --json Addresses.Swarm \
   "[\"/ip4/0.0.0.0/tcp/$SWARM\",\"/ip6/::/tcp/$SWARM\",\"/ip4/0.0.0.0/udp/$SWARM/quic-v1\",\"/ip6/::/udp/$SWARM/quic-v1\"]"
+# Garbage-collect cached (unpinned) blocks, e.g. photos fetched for review or for a map's
+# /ipfs/<cid> endpoint, once the repo passes 90% of StorageMax. Pinned photos are never removed.
+as_heritage ipfs config Datastore.StorageMax "${IPFS_STORAGE_MAX:-10GB}"
+as_heritage ipfs config Datastore.GCPeriod 1h
 if [ -n "${IPFS_MAX_MEMORY:-}" ]; then   # e.g. 512MB on small machines
   as_heritage ipfs config Swarm.ResourceMgr.MaxMemory "$IPFS_MAX_MEMORY"
 fi
@@ -90,7 +95,7 @@ Wants=network-online.target
 [Service]
 User=heritage
 Environment=IPFS_PATH=$IPFS_PATH
-ExecStart=/usr/local/bin/ipfs daemon --migrate
+ExecStart=/usr/local/bin/ipfs daemon --migrate --enable-gc
 Restart=on-failure
 NoNewPrivileges=true
 ProtectSystem=strict
