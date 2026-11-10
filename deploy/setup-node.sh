@@ -30,7 +30,7 @@ export IPFS_PATH="$VAR/ipfs"
 
 echo "==> packages"
 apt-get update -q
-apt-get install -y -q git python3 curl openssh-client
+apt-get install -y -q git python3 python3-pil curl openssh-client
 python3 -c 'import tomllib' 2>/dev/null || apt-get install -y -q python3-tomli
 
 echo "==> kubo $KUBO_VERSION"
